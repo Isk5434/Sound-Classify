@@ -263,88 +263,21 @@ def add_sample_cb(audio, label):
     DATA.append({"audio": audio_n, "U": U, "label": label})
     return dataset_table(), gr.update(value=None)
 
-# ── 自動録音: ストリーミング蓄積 + 無音検出 ──
+def auto_add_sample_cb(audio, label):
+    """録音完了時に自動でDATAに追加"""
+    label = (label or "").strip()
+    if label not in LABELS:
+        return dataset_table(), gr.update(value=None), "⚠ ラベルを選択してください"
+    if audio is None:
+        return dataset_table(), gr.update(value=None), "待機中..."
 
-SILENCE_THRESH = 0.012
-SILENCE_CHUNKS_NEEDED = 3   # 約1.5秒（stream_every=0.5sなので 0.5×3=1.5s）
-MIN_SPEECH_CHUNKS = 2       # 最低2チャンク分の音声
+    audio_n = normalize_audio_tuple(audio)
+    U = audio_to_sequence(audio_n)
+    if U is None or len(U) < 5:
+        return dataset_table(), gr.update(value=None), "⚠ 音声が短すぎます"
 
-def _new_rec_state():
-    return {"chunks": [], "speech_detected": False, "silence_count": 0, "saved": False, "status": "待機中"}
-
-def rec_stream_cb(chunk, label, rec_state):
-    """ストリーミング録音: 音声蓄積 + 無音検出 → 自動保存"""
-    if rec_state is None:
-        rec_state = _new_rec_state()
-
-    if rec_state.get("saved", False):
-        # 前回保存済み → リセット
-        rec_state = _new_rec_state()
-
-    if chunk is None:
-        return rec_state, dataset_table(), "待機中... マイクを開始してください"
-
-    sr, y = chunk
-    if y is None or len(y) < 10:
-        return rec_state, gr.update(), rec_state.get("status", "")
-
-    y = _mono_float32(y)
-
-    # RMS計算
-    rms = float(np.sqrt(np.mean(y ** 2)))
-
-    if rms > SILENCE_THRESH:
-        # 音声あり
-        rec_state["chunks"].append((sr, y.copy()))
-        rec_state["speech_detected"] = True
-        rec_state["silence_count"] = 0
-        n = len(rec_state["chunks"])
-        rec_state["status"] = f"録音中... 🎙️ ({n} chunks)"
-    else:
-        # 無音
-        if rec_state["speech_detected"]:
-            rec_state["silence_count"] = rec_state.get("silence_count", 0) + 1
-            remaining = max(0, SILENCE_CHUNKS_NEEDED - rec_state["silence_count"])
-            rec_state["status"] = f"無音検出中... あと{remaining}で自動保存"
-
-            if rec_state["silence_count"] >= SILENCE_CHUNKS_NEEDED:
-                # 十分な音声があれば保存
-                if len(rec_state["chunks"]) >= MIN_SPEECH_CHUNKS:
-                    label = (label or "").strip()
-                    if label in LABELS:
-                        # チャンクを結合
-                        all_y = []
-                        final_sr = SR
-                        for s, y_chunk in rec_state["chunks"]:
-                            if s != SR:
-                                y_chunk = librosa.resample(y_chunk, orig_sr=s, target_sr=SR)
-                            all_y.append(y_chunk)
-                        full_y = np.concatenate(all_y).astype(np.float32)
-                        full_y /= (np.max(np.abs(full_y)) + 1e-9)
-                        audio_n = (SR, full_y)
-                        U = audio_to_sequence(audio_n)
-                        if U is not None and len(U) >= 5:
-                            DATA.append({"audio": audio_n, "U": U, "label": label})
-                            rec_state["status"] = f"✓ 自動保存完了 (idx={len(DATA)-1})"
-                        else:
-                            rec_state["status"] = "音声が短すぎます"
-                    else:
-                        rec_state["status"] = "ラベルを選択してください"
-
-                    rec_state["saved"] = True
-                    rec_state["chunks"] = []
-                    rec_state["speech_detected"] = False
-                    rec_state["silence_count"] = 0
-                    return rec_state, dataset_table(), rec_state["status"]
-                else:
-                    rec_state["status"] = "音声が短すぎます。もう一度話してください"
-                    rec_state["chunks"] = []
-                    rec_state["speech_detected"] = False
-                    rec_state["silence_count"] = 0
-        else:
-            rec_state["status"] = "待機中... 話してください 🎤"
-
-    return rec_state, gr.update(), rec_state.get("status", "")
+    DATA.append({"audio": audio_n, "U": U, "label": label})
+    return dataset_table(), gr.update(value=None), f"✓ 保存完了 (idx={len(DATA)-1})"
 
 def undo_last_cb():
     if len(DATA) == 0:
@@ -408,6 +341,106 @@ HEAD = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script>
+/* ── 無音自動停止: Web Audio API で音量監視 → 停止ボタン自動クリック ── */
+(function(){
+  const SILENCE_THRESHOLD = 0.01;
+  const SILENCE_MS = 1500;
+  const SPEECH_THRESHOLD = 0.015;
+  let audioCtx, analyser, srcNode, silenceStart, speechDetected, monitoring;
+
+  function getRecArea() {
+    return document.getElementById('auto_rec_area');
+  }
+  function getStopBtn() {
+    const area = getRecArea();
+    if (!area) return null;
+    /* Gradio 6: 録音中は stop ボタン(■)が出る。aria-label で探す */
+    let btn = area.querySelector('button[aria-label="Stop recording"]');
+    if (btn) return btn;
+    btn = area.querySelector('button[aria-label="停止"]');
+    if (btn) return btn;
+    /* フォールバック: 録音中に表示される赤い■ボタンを探す */
+    const btns = area.querySelectorAll('button');
+    for (const b of btns) {
+      const svg = b.querySelector('svg');
+      if (svg) {
+        const rect = svg.querySelector('rect');
+        if (rect) return b;          /* ■アイコンがある = stop */
+      }
+    }
+    return null;
+  }
+
+  function startMonitoring(stream) {
+    if (monitoring) return;
+    monitoring = true;
+    speechDetected = false;
+    silenceStart = null;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    srcNode = audioCtx.createMediaStreamSource(stream);
+    srcNode.connect(analyser);
+    const buf = new Float32Array(analyser.fftSize);
+    const statusEl = document.getElementById('rec_status_js');
+
+    function tick() {
+      if (!monitoring) return;
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+
+      if (rms > SPEECH_THRESHOLD) {
+        speechDetected = true;
+        silenceStart = null;
+        if (statusEl) statusEl.textContent = '録音中... 🎙️';
+      } else if (speechDetected && rms < SILENCE_THRESHOLD) {
+        if (!silenceStart) silenceStart = Date.now();
+        const elapsed = Date.now() - silenceStart;
+        const remain = Math.max(0, Math.ceil((SILENCE_MS - elapsed) / 1000));
+        if (statusEl) statusEl.textContent = '無音検出中... あと' + remain + '秒';
+        if (elapsed >= SILENCE_MS) {
+          if (statusEl) statusEl.textContent = '自動停止...';
+          const stopBtn = getStopBtn();
+          if (stopBtn) stopBtn.click();
+          stopMonitoring();
+          return;
+        }
+      } else {
+        if (statusEl) statusEl.textContent = '待機中... 話してください 🎤';
+      }
+      requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  function stopMonitoring() {
+    monitoring = false;
+    if (srcNode) { try { srcNode.disconnect(); } catch(e){} }
+    if (audioCtx) { try { audioCtx.close(); } catch(e){} }
+    srcNode = null; audioCtx = null; analyser = null;
+  }
+
+  /* MediaStream を横取り: getUserMedia を wrap */
+  const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = function(constraints) {
+    return origGetUserMedia(constraints).then(function(stream) {
+      if (constraints && constraints.audio) {
+        const area = getRecArea();
+        if (area) {
+          startMonitoring(stream);
+          stream.getAudioTracks().forEach(function(track) {
+            track.addEventListener('ended', stopMonitoring);
+          });
+        }
+      }
+      return stream;
+    });
+  };
+})();
+</script>
 """
 
 CSS = """
@@ -1040,12 +1073,10 @@ with gr.Blocks() as demo:
             # 録音 & サンプル追加（自動停止）
             gr.Markdown("### 録音（自動停止）")
             label_dd = gr.Radio(choices=LABELS, label="ラベル選択", interactive=True, elem_classes=["diamond-radio"])
-            rec_audio = gr.Audio(sources=["microphone"], streaming=True, type="numpy", label="マイク（開始で録音）")
-            rec_status_md = gr.Markdown("待機中... マイクを開始してください", elem_classes=["rec-status"])
-            rec_state = gr.State(None)
-            # 隠し（手動追加用に残す）
-            audio_rec = gr.Audio(type="numpy", visible=False)
-            add_sample_btn = gr.Button("追加", variant="primary", size="lg", visible=False)
+            with gr.Column(elem_id="auto_rec_area"):
+                audio_rec = gr.Audio(sources=["microphone"], type="numpy", label="マイク（録音→自動停止→自動保存）")
+                gr.HTML('<div id="rec_status_js" class="rec-status">待機中... 録音ボタンを押してください</div>')
+            rec_status_md = gr.Markdown("", elem_classes=["rec-status"])
             undo_btn = gr.Button("Undo", size="lg")
 
             # データ一覧 & 編集
@@ -1082,12 +1113,11 @@ with gr.Blocks() as demo:
 
     # wiring
     add_btn.click(add_label_cb, inputs=[label_box], outputs=[label_dd, table, relabel_dd])
-    add_sample_btn.click(add_sample_cb, inputs=[audio_rec, label_dd], outputs=[table, audio_rec])
     undo_btn.click(undo_last_cb, inputs=[], outputs=[table])
     reset_btn.click(reset_all_cb, inputs=[], outputs=[table, label_dd, relabel_dd, audio_rec, selected_idx_state])
 
-    # ストリーミング録音 → 自動停止 & 保存
-    rec_audio.stream(rec_stream_cb, inputs=[rec_audio, label_dd, rec_state], outputs=[rec_state, table, rec_status_md], stream_every=0.5)
+    # 録音完了（停止）時に自動保存
+    audio_rec.stop_recording(auto_add_sample_cb, inputs=[audio_rec, label_dd], outputs=[table, audio_rec, rec_status_md])
 
     # select row -> update state + replay + relabel dropdown value
     def _select_and_store(evt: gr.SelectData):
