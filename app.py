@@ -342,89 +342,67 @@ HEAD = """
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script>
-/* ── 無音自動停止 ── */
+/* ── 無音自動停止（Gradio公式 .stop-button/.record-button セレクタ使用） ── */
 (function(){
   const SILENCE_THRESH = 0.01;
   const SPEECH_THRESH  = 0.015;
   const SILENCE_MS     = 1500;
-  let audioCtx, analyser, src, silenceStart, speechDetected, running;
+  let ctx, analyser, src, silStart, spoke, on;
 
-  function setStatus(msg) {
-    const el = document.getElementById('rec_status_js');
-    if (el) el.textContent = msg;
+  function stat(m){ var e=document.getElementById('rec_status_js'); if(e) e.textContent=m; }
+
+  function stop(){
+    on=false;
+    try{src&&src.disconnect()}catch(e){}
+    try{ctx&&ctx.close()}catch(e){}
+    src=null;ctx=null;analyser=null;
   }
 
-  function findStopBtn() {
-    /* aria-label で探す（言語問わず） */
-    const candidates = [
-      'button[aria-label="Stop recording"]',
-      'button[aria-label="停止"]',
-      'button[aria-label="stop"]',
-    ];
-    for (const sel of candidates) {
-      const b = document.querySelector(sel);
-      if (b) return b;
-    }
-    /* フォールバック: SVG内に <rect> があるボタン（■停止アイコン） */
-    for (const b of document.querySelectorAll('button')) {
-      if (b.querySelector('svg rect')) return b;
-    }
-    return null;
-  }
+  function monitor(stream){
+    stop();
+    on=true; spoke=false; silStart=null;
+    ctx=new(window.AudioContext||window.webkitAudioContext)();
+    analyser=ctx.createAnalyser(); analyser.fftSize=512;
+    src=ctx.createMediaStreamSource(stream); src.connect(analyser);
+    var buf=new Float32Array(analyser.fftSize);
 
-  function stopAll() {
-    running = false;
-    try { if (src) src.disconnect(); } catch(e){}
-    try { if (audioCtx) audioCtx.close(); } catch(e){}
-    src = null; audioCtx = null; analyser = null;
-  }
-
-  function startMonitor(stream) {
-    stopAll();
-    running = true; speechDetected = false; silenceStart = null;
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 512;
-    src = audioCtx.createMediaStreamSource(stream);
-    src.connect(analyser);
-    const buf = new Float32Array(analyser.fftSize);
-
-    function tick() {
-      if (!running) return;
+    function tick(){
+      if(!on)return;
       analyser.getFloatTimeDomainData(buf);
-      let rms = 0;
-      for (let i = 0; i < buf.length; i++) rms += buf[i]*buf[i];
-      rms = Math.sqrt(rms / buf.length);
+      var s=0; for(var i=0;i<buf.length;i++) s+=buf[i]*buf[i];
+      var rms=Math.sqrt(s/buf.length);
 
-      if (rms > SPEECH_THRESH) {
-        speechDetected = true; silenceStart = null;
-        setStatus('録音中... 🎙️');
-      } else if (speechDetected && rms < SILENCE_THRESH) {
-        if (!silenceStart) silenceStart = Date.now();
-        const left = Math.max(0, SILENCE_MS - (Date.now() - silenceStart));
-        setStatus('無音検出中... あと' + Math.ceil(left/1000) + '秒で自動停止');
-        if (left <= 0) {
-          setStatus('自動停止 & 保存中...');
-          const btn = findStopBtn();
-          if (btn) btn.click();
-          stopAll();
+      if(rms>SPEECH_THRESH){
+        spoke=true; silStart=null;
+        stat('録音中... 🎙️');
+      } else if(spoke && rms<SILENCE_THRESH){
+        if(!silStart) silStart=Date.now();
+        var left=Math.max(0,SILENCE_MS-(Date.now()-silStart));
+        stat('無音検出中... あと'+Math.ceil(left/1000)+'秒');
+        if(left<=0){
+          stat('自動停止 & 保存中...');
+          /* Gradio公式: .stop-button で停止ボタンを取得 */
+          var btn=document.querySelector('.stop-button');
+          console.log('[auto-stop] .stop-button found:', btn);
+          if(btn){ btn.click(); }
+          stop();
           return;
         }
-      } else if (!speechDetected) {
-        setStatus('待機中... 話してください 🎤');
+      } else if(!spoke){
+        stat('待機中... 話してください 🎤');
       }
       requestAnimationFrame(tick);
     }
     tick();
   }
 
-  /* getUserMedia をラップ */
-  const orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-  navigator.mediaDevices.getUserMedia = function(c) {
-    return orig(c).then(function(stream) {
-      if (c && c.audio) {
-        startMonitor(stream);
-        stream.getAudioTracks().forEach(t => t.addEventListener('ended', stopAll));
+  var orig=navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia=function(c){
+    return orig(c).then(function(stream){
+      if(c&&c.audio){
+        console.log('[auto-stop] getUserMedia intercepted, starting monitor');
+        monitor(stream);
+        stream.getAudioTracks().forEach(function(t){t.addEventListener('ended',stop);});
       }
       return stream;
     });
