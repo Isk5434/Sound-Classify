@@ -264,20 +264,20 @@ def add_sample_cb(audio, label):
     return dataset_table(), gr.update(value=None)
 
 def auto_add_sample_cb(audio, label):
-    """録音完了時に自動でDATAに追加"""
+    """録音完了（stop_recording）時に自動でDATAに追加"""
     label = (label or "").strip()
     if label not in LABELS:
-        return dataset_table(), gr.update(value=None), "⚠ ラベルを選択してください"
+        return dataset_table(), gr.update(value=None), "⚠ ラベルを先に選択してください"
     if audio is None:
         return dataset_table(), gr.update(value=None), "待機中..."
 
     audio_n = normalize_audio_tuple(audio)
     U = audio_to_sequence(audio_n)
     if U is None or len(U) < 5:
-        return dataset_table(), gr.update(value=None), "⚠ 音声が短すぎます"
+        return dataset_table(), gr.update(value=None), "⚠ 音声が短すぎます（もう少し話してください）"
 
     DATA.append({"audio": audio_n, "U": U, "label": label})
-    return dataset_table(), gr.update(value=None), f"✓ 保存完了 (idx={len(DATA)-1})"
+    return dataset_table(), gr.update(value=None), f"✓ 保存完了！ (idx={len(DATA)-1}, label={label})"
 
 def undo_last_cb():
     if len(DATA) == 0:
@@ -342,99 +342,89 @@ HEAD = """
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script>
-/* ── 無音自動停止: Web Audio API で音量監視 → 停止ボタン自動クリック ── */
+/* ── 無音自動停止 ── */
 (function(){
-  const SILENCE_THRESHOLD = 0.01;
-  const SILENCE_MS = 1500;
-  const SPEECH_THRESHOLD = 0.015;
-  let audioCtx, analyser, srcNode, silenceStart, speechDetected, monitoring;
+  const SILENCE_THRESH = 0.01;
+  const SPEECH_THRESH  = 0.015;
+  const SILENCE_MS     = 1500;
+  let audioCtx, analyser, src, silenceStart, speechDetected, running;
 
-  function getRecArea() {
-    return document.getElementById('auto_rec_area');
+  function setStatus(msg) {
+    const el = document.getElementById('rec_status_js');
+    if (el) el.textContent = msg;
   }
-  function getStopBtn() {
-    const area = getRecArea();
-    if (!area) return null;
-    /* Gradio 6: 録音中は stop ボタン(■)が出る。aria-label で探す */
-    let btn = area.querySelector('button[aria-label="Stop recording"]');
-    if (btn) return btn;
-    btn = area.querySelector('button[aria-label="停止"]');
-    if (btn) return btn;
-    /* フォールバック: 録音中に表示される赤い■ボタンを探す */
-    const btns = area.querySelectorAll('button');
-    for (const b of btns) {
-      const svg = b.querySelector('svg');
-      if (svg) {
-        const rect = svg.querySelector('rect');
-        if (rect) return b;          /* ■アイコンがある = stop */
-      }
+
+  function findStopBtn() {
+    /* aria-label で探す（言語問わず） */
+    const candidates = [
+      'button[aria-label="Stop recording"]',
+      'button[aria-label="停止"]',
+      'button[aria-label="stop"]',
+    ];
+    for (const sel of candidates) {
+      const b = document.querySelector(sel);
+      if (b) return b;
+    }
+    /* フォールバック: SVG内に <rect> があるボタン（■停止アイコン） */
+    for (const b of document.querySelectorAll('button')) {
+      if (b.querySelector('svg rect')) return b;
     }
     return null;
   }
 
-  function startMonitoring(stream) {
-    if (monitoring) return;
-    monitoring = true;
-    speechDetected = false;
-    silenceStart = null;
+  function stopAll() {
+    running = false;
+    try { if (src) src.disconnect(); } catch(e){}
+    try { if (audioCtx) audioCtx.close(); } catch(e){}
+    src = null; audioCtx = null; analyser = null;
+  }
+
+  function startMonitor(stream) {
+    stopAll();
+    running = true; speechDetected = false; silenceStart = null;
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
-    srcNode = audioCtx.createMediaStreamSource(stream);
-    srcNode.connect(analyser);
+    src = audioCtx.createMediaStreamSource(stream);
+    src.connect(analyser);
     const buf = new Float32Array(analyser.fftSize);
-    const statusEl = document.getElementById('rec_status_js');
 
     function tick() {
-      if (!monitoring) return;
+      if (!running) return;
       analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-      const rms = Math.sqrt(sum / buf.length);
+      let rms = 0;
+      for (let i = 0; i < buf.length; i++) rms += buf[i]*buf[i];
+      rms = Math.sqrt(rms / buf.length);
 
-      if (rms > SPEECH_THRESHOLD) {
-        speechDetected = true;
-        silenceStart = null;
-        if (statusEl) statusEl.textContent = '録音中... 🎙️';
-      } else if (speechDetected && rms < SILENCE_THRESHOLD) {
+      if (rms > SPEECH_THRESH) {
+        speechDetected = true; silenceStart = null;
+        setStatus('録音中... 🎙️');
+      } else if (speechDetected && rms < SILENCE_THRESH) {
         if (!silenceStart) silenceStart = Date.now();
-        const elapsed = Date.now() - silenceStart;
-        const remain = Math.max(0, Math.ceil((SILENCE_MS - elapsed) / 1000));
-        if (statusEl) statusEl.textContent = '無音検出中... あと' + remain + '秒';
-        if (elapsed >= SILENCE_MS) {
-          if (statusEl) statusEl.textContent = '自動停止...';
-          const stopBtn = getStopBtn();
-          if (stopBtn) stopBtn.click();
-          stopMonitoring();
+        const left = Math.max(0, SILENCE_MS - (Date.now() - silenceStart));
+        setStatus('無音検出中... あと' + Math.ceil(left/1000) + '秒で自動停止');
+        if (left <= 0) {
+          setStatus('自動停止 & 保存中...');
+          const btn = findStopBtn();
+          if (btn) btn.click();
+          stopAll();
           return;
         }
-      } else {
-        if (statusEl) statusEl.textContent = '待機中... 話してください 🎤';
+      } else if (!speechDetected) {
+        setStatus('待機中... 話してください 🎤');
       }
       requestAnimationFrame(tick);
     }
     tick();
   }
 
-  function stopMonitoring() {
-    monitoring = false;
-    if (srcNode) { try { srcNode.disconnect(); } catch(e){} }
-    if (audioCtx) { try { audioCtx.close(); } catch(e){} }
-    srcNode = null; audioCtx = null; analyser = null;
-  }
-
-  /* MediaStream を横取り: getUserMedia を wrap */
-  const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-  navigator.mediaDevices.getUserMedia = function(constraints) {
-    return origGetUserMedia(constraints).then(function(stream) {
-      if (constraints && constraints.audio) {
-        const area = getRecArea();
-        if (area) {
-          startMonitoring(stream);
-          stream.getAudioTracks().forEach(function(track) {
-            track.addEventListener('ended', stopMonitoring);
-          });
-        }
+  /* getUserMedia をラップ */
+  const orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = function(c) {
+    return orig(c).then(function(stream) {
+      if (c && c.audio) {
+        startMonitor(stream);
+        stream.getAudioTracks().forEach(t => t.addEventListener('ended', stopAll));
       }
       return stream;
     });
@@ -1116,7 +1106,7 @@ with gr.Blocks() as demo:
     undo_btn.click(undo_last_cb, inputs=[], outputs=[table])
     reset_btn.click(reset_all_cb, inputs=[], outputs=[table, label_dd, relabel_dd, audio_rec, selected_idx_state])
 
-    # 録音完了（停止）時に自動保存
+    # 録音完了時に自動保存（stop_recording = 停止ボタン押下）
     audio_rec.stop_recording(auto_add_sample_cb, inputs=[audio_rec, label_dd], outputs=[table, audio_rec, rec_status_md])
 
     # select row -> update state + replay + relabel dropdown value
