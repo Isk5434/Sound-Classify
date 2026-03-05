@@ -263,6 +263,89 @@ def add_sample_cb(audio, label):
     DATA.append({"audio": audio_n, "U": U, "label": label})
     return dataset_table(), gr.update(value=None)
 
+# ── 自動録音: ストリーミング蓄積 + 無音検出 ──
+
+SILENCE_THRESH = 0.012
+SILENCE_CHUNKS_NEEDED = 3   # 約1.5秒（stream_every=0.5sなので 0.5×3=1.5s）
+MIN_SPEECH_CHUNKS = 2       # 最低2チャンク分の音声
+
+def _new_rec_state():
+    return {"chunks": [], "speech_detected": False, "silence_count": 0, "saved": False, "status": "待機中"}
+
+def rec_stream_cb(chunk, label, rec_state):
+    """ストリーミング録音: 音声蓄積 + 無音検出 → 自動保存"""
+    if rec_state is None:
+        rec_state = _new_rec_state()
+
+    if rec_state.get("saved", False):
+        # 前回保存済み → リセット
+        rec_state = _new_rec_state()
+
+    if chunk is None:
+        return rec_state, dataset_table(), "待機中... マイクを開始してください"
+
+    sr, y = chunk
+    if y is None or len(y) < 10:
+        return rec_state, gr.update(), rec_state.get("status", "")
+
+    y = _mono_float32(y)
+
+    # RMS計算
+    rms = float(np.sqrt(np.mean(y ** 2)))
+
+    if rms > SILENCE_THRESH:
+        # 音声あり
+        rec_state["chunks"].append((sr, y.copy()))
+        rec_state["speech_detected"] = True
+        rec_state["silence_count"] = 0
+        n = len(rec_state["chunks"])
+        rec_state["status"] = f"録音中... 🎙️ ({n} chunks)"
+    else:
+        # 無音
+        if rec_state["speech_detected"]:
+            rec_state["silence_count"] = rec_state.get("silence_count", 0) + 1
+            remaining = max(0, SILENCE_CHUNKS_NEEDED - rec_state["silence_count"])
+            rec_state["status"] = f"無音検出中... あと{remaining}で自動保存"
+
+            if rec_state["silence_count"] >= SILENCE_CHUNKS_NEEDED:
+                # 十分な音声があれば保存
+                if len(rec_state["chunks"]) >= MIN_SPEECH_CHUNKS:
+                    label = (label or "").strip()
+                    if label in LABELS:
+                        # チャンクを結合
+                        all_y = []
+                        final_sr = SR
+                        for s, y_chunk in rec_state["chunks"]:
+                            if s != SR:
+                                y_chunk = librosa.resample(y_chunk, orig_sr=s, target_sr=SR)
+                            all_y.append(y_chunk)
+                        full_y = np.concatenate(all_y).astype(np.float32)
+                        full_y /= (np.max(np.abs(full_y)) + 1e-9)
+                        audio_n = (SR, full_y)
+                        U = audio_to_sequence(audio_n)
+                        if U is not None and len(U) >= 5:
+                            DATA.append({"audio": audio_n, "U": U, "label": label})
+                            rec_state["status"] = f"✓ 自動保存完了 (idx={len(DATA)-1})"
+                        else:
+                            rec_state["status"] = "音声が短すぎます"
+                    else:
+                        rec_state["status"] = "ラベルを選択してください"
+
+                    rec_state["saved"] = True
+                    rec_state["chunks"] = []
+                    rec_state["speech_detected"] = False
+                    rec_state["silence_count"] = 0
+                    return rec_state, dataset_table(), rec_state["status"]
+                else:
+                    rec_state["status"] = "音声が短すぎます。もう一度話してください"
+                    rec_state["chunks"] = []
+                    rec_state["speech_detected"] = False
+                    rec_state["silence_count"] = 0
+        else:
+            rec_state["status"] = "待機中... 話してください 🎤"
+
+    return rec_state, gr.update(), rec_state.get("status", "")
+
 def undo_last_cb():
     if len(DATA) == 0:
         return dataset_table()
@@ -827,6 +910,22 @@ textarea {
 }
 
 /* ========================================
+   自動録音: ステータス表示
+   ======================================== */
+.rec-status {
+    text-align: center;
+    padding: 8px 12px;
+    font-family: 'Cormorant Garamond', 'Georgia', serif;
+    font-size: 14px;
+    color: #4a6a4a;
+    letter-spacing: 0.06em;
+}
+@keyframes recPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+/* ========================================
    スクロールバー
    ======================================== */
 ::-webkit-scrollbar { width: 4px; }
@@ -938,14 +1037,16 @@ with gr.Blocks() as demo:
                 label_box = gr.Textbox(label="新ラベル", placeholder="例: yes", scale=3)
                 add_btn = gr.Button("追加", size="lg", scale=1)
 
-            # 録音 & サンプル追加
-            gr.Markdown("### 録音")
+            # 録音 & サンプル追加（自動停止）
+            gr.Markdown("### 録音（自動停止）")
             label_dd = gr.Radio(choices=LABELS, label="ラベル選択", interactive=True, elem_classes=["diamond-radio"])
-            audio_rec = gr.Audio(sources=["microphone"], type="numpy", label="録音")
-            add_sample_btn = gr.Button("追加", variant="primary", size="lg")
-            with gr.Row():
-                undo_btn = gr.Button("Undo", size="lg")
-                rerec_btn = gr.Button("Clear", size="lg")
+            rec_audio = gr.Audio(sources=["microphone"], streaming=True, type="numpy", label="マイク（開始で録音）")
+            rec_status_md = gr.Markdown("待機中... マイクを開始してください", elem_classes=["rec-status"])
+            rec_state = gr.State(None)
+            # 隠し（手動追加用に残す）
+            audio_rec = gr.Audio(type="numpy", visible=False)
+            add_sample_btn = gr.Button("追加", variant="primary", size="lg", visible=False)
+            undo_btn = gr.Button("Undo", size="lg")
 
             # データ一覧 & 編集
             gr.Markdown("### データ一覧")
@@ -954,7 +1055,7 @@ with gr.Blocks() as demo:
                 value=dataset_table(),
                 datatype=["number", "str", "number"],
                 row_count=(6, "dynamic"),
-                col_count=(3, "fixed"),
+                column_count=(3, "fixed"),
                 interactive=False,
                 elem_id="data_table"
             )
@@ -983,8 +1084,10 @@ with gr.Blocks() as demo:
     add_btn.click(add_label_cb, inputs=[label_box], outputs=[label_dd, table, relabel_dd])
     add_sample_btn.click(add_sample_cb, inputs=[audio_rec, label_dd], outputs=[table, audio_rec])
     undo_btn.click(undo_last_cb, inputs=[], outputs=[table])
-    rerec_btn.click(clear_rec_cb, inputs=[], outputs=[audio_rec])
     reset_btn.click(reset_all_cb, inputs=[], outputs=[table, label_dd, relabel_dd, audio_rec, selected_idx_state])
+
+    # ストリーミング録音 → 自動停止 & 保存
+    rec_audio.stream(rec_stream_cb, inputs=[rec_audio, label_dd, rec_state], outputs=[rec_state, table, rec_status_md], stream_every=0.5)
 
     # select row -> update state + replay + relabel dropdown value
     def _select_and_store(evt: gr.SelectData):
